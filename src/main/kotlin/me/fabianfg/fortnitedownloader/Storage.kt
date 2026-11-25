@@ -39,6 +39,7 @@ class Storage internal constructor(val chunkPoolCapacity : Int, val cacheLocatio
 
     companion object {
         private val logger = KotlinLogging.logger("MountedBuild")
+        private const val WAIT_RECHECK_SECONDS = 30L
     }
 
     init {
@@ -65,68 +66,78 @@ class Storage internal constructor(val chunkPoolCapacity : Int, val cacheLocatio
     fun getChunk(chunk: Chunk): ByteArray? {
         val data = getPoolData(chunk)
 
-        fun doDownload() {
-            data.status.set(ChunkStatus.Grabbing)
-            val chunkData = downloadChunk(chunk)
-            if (chunkData != null) {
-                // I guess that really can't happen
-                //if (chunkData.size != chunk.windowSize)
-                //    logger.error { "Failed to download chunk ${chunk.url()} correctly" }
-                data.buffer = chunkData
-                data.status.set(ChunkStatus.Readable)
-            } else {
-                data.buffer = null
-                data.status.set(ChunkStatus.Unavailable)
-            }
+        // The thread that claimed the chunk publishes the result, then wakes the waiters under the lock
+        fun finish(buffer: ByteArray?, status: ChunkStatus) {
+            data.buffer = buffer
+            data.status.set(status)
             data.mutex.withLock {
                 data.cv.signalAll()
             }
         }
 
-        when(data.status.get()) {
-            ChunkStatus.Unavailable -> {
-                // download
-                doDownload()
-            }
-            ChunkStatus.Available -> {
-                // read from file
-                data.status.set(ChunkStatus.Reading)
+        fun doDownload(): ByteArray? {
+            val chunkData = downloadChunk(chunk)
+            if (chunkData != null) finish(chunkData, ChunkStatus.Readable) else finish(null, ChunkStatus.Unavailable)
+            return chunkData
+        }
 
-                val chunkData = runCatching { File(cacheLocation + chunk.fileName()).readBytes() }.getOrNull()
-                if (chunkData == null || chunkData.size != chunk.windowSize) {
-                    // That can / will happen if the chunk is very new on the file system
-                    // It can also happen if the chunk file just got deleted
-                    if (chunkData == null)
-                        logger.warn { "Failed to read chunk ${chunk.fileName()} from file, didn't receive anything. Why tho" }
-                    else
-                        logger.warn { "Failed to read chunk ${chunk.fileName()} from file. Expected ${chunk.windowSize} bytes, got ${chunkData.size} bytes. Why tho" }
-                    doDownload()
-                    if (data.status.get() == ChunkStatus.Readable)
-                        logger.info { "Re-download of previously failed chunk ${chunk.fileName()} succeeded" }
-                    else
-                        logger.info { "Re-download of previously failed chunk ${chunk.fileName()} also failed" }
-                } else {
-                    data.buffer = chunkData
-                    data.status.set(ChunkStatus.Readable)
-                }
-                data.mutex.withLock {
-                    data.cv.signalAll()
-                }
-            }
-            ChunkStatus.Grabbing, ChunkStatus.Reading -> {
-                // downloading from server / reading from file, wait until mutex releases
-                data.mutex.withLock {
-                    data.cv.await()
-                }
-            }
-            ChunkStatus.Readable -> {
-                // available in memory pool
-            }
-            else -> {
-                // how
+        // Runs the claimed work; if it throws, the chunk is released so waiters don't wait forever
+        fun claimed(work: () -> ByteArray?): ByteArray? {
+            try {
+                return work()
+            } finally {
+                val status = data.status.get()
+                if (status == ChunkStatus.Grabbing || status == ChunkStatus.Reading) finish(null, ChunkStatus.Unavailable)
             }
         }
-        return data.buffer
+
+        var waited = false
+        while (true) {
+            when (data.status.get()) {
+                ChunkStatus.Readable -> return data.buffer
+                ChunkStatus.Unavailable -> {
+                    // A waiter whose chunk just failed gives up, as before, instead of retrying it in turn
+                    if (waited) return null
+                    // compareAndSet: only one thread downloads a chunk, the rest wait for it
+                    if (data.status.compareAndSet(ChunkStatus.Unavailable, ChunkStatus.Grabbing)) {
+                        return claimed { doDownload() }
+                    }
+                }
+                ChunkStatus.Available -> {
+                    if (data.status.compareAndSet(ChunkStatus.Available, ChunkStatus.Reading)) {
+                        return claimed {
+                            val chunkData = runCatching { File(cacheLocation + chunk.fileName()).readBytes() }.getOrNull()
+                            if (chunkData == null || chunkData.size != chunk.windowSize) {
+                                // That can / will happen if the chunk is very new on the file system
+                                // It can also happen if the chunk file just got deleted
+                                if (chunkData == null)
+                                    logger.warn { "Failed to read chunk ${chunk.fileName()} from file, didn't receive anything. Why tho" }
+                                else
+                                    logger.warn { "Failed to read chunk ${chunk.fileName()} from file. Expected ${chunk.windowSize} bytes, got ${chunkData.size} bytes. Why tho" }
+                                val downloaded = doDownload()
+                                if (downloaded != null)
+                                    logger.info { "Re-download of previously failed chunk ${chunk.fileName()} succeeded" }
+                                else
+                                    logger.info { "Re-download of previously failed chunk ${chunk.fileName()} also failed" }
+                                downloaded
+                            } else {
+                                finish(chunkData, ChunkStatus.Readable)
+                                chunkData
+                            }
+                        }
+                    }
+                }
+                ChunkStatus.Grabbing, ChunkStatus.Reading -> {
+                    waited = true
+                    data.mutex.withLock {
+                        // Recheck under the lock: a signal sent before this thread started waiting would otherwise be missed forever
+                        while (data.status.get().let { it == ChunkStatus.Grabbing || it == ChunkStatus.Reading }) {
+                            data.cv.await(WAIT_RECHECK_SECONDS, TimeUnit.SECONDS)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun getPoolData(chunk: Chunk) = chunkPoolMutex.withLock {
