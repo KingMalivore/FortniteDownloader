@@ -6,7 +6,11 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.internal.closeQuietly
 import java.io.File
+import java.io.IOException
 import java.io.InputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.Condition
@@ -164,6 +168,20 @@ class Storage internal constructor(val chunkPoolCapacity : Int, val cacheLocatio
     fun isChunkDownloaded(chunk: Chunk) =
         File(cacheLocation + chunk.fileName()).exists()
 
+    // Write to a temp file, then rename, so another thread never reads a half-written chunk file
+    private fun writeChunkFile(chunk: Chunk, data: ByteArray) {
+        val target = File(cacheLocation + chunk.fileName()).toPath()
+        val temp = target.resolveSibling(target.fileName.toString() + ".part-" + UUID.randomUUID())
+        Files.write(temp, data)
+        try {
+            Files.move(temp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        } catch (e: IOException) {
+            // Windows refuses to replace a file another thread has open; that copy is the same chunk
+            Files.deleteIfExists(temp)
+            if (!Files.exists(target)) throw e
+        }
+    }
+
     @Suppress("EXPERIMENTAL_API_USAGE")
     fun downloadChunk(chunk: Chunk) = runCatching {
         val response = client.newCall(Request.Builder()
@@ -204,7 +222,7 @@ class Storage internal constructor(val chunkPoolCapacity : Int, val cacheLocatio
                     out.toByteArray()
                 }
             }
-            File(cacheLocation + chunk.fileName()).writeBytes(data)
+            writeChunkFile(chunk, data)
             data
         } else {
             logger.warn { "Received response code ${response.code} for chunk ${response.request.url}" }
