@@ -70,7 +70,6 @@ class Storage internal constructor(val chunkPoolCapacity : Int, val cacheLocatio
     fun getChunk(chunk: Chunk): ByteArray? {
         val data = getPoolData(chunk)
 
-        // The thread that claimed the chunk publishes the result, then wakes the waiters under the lock
         fun finish(buffer: ByteArray?, status: ChunkStatus) {
             data.buffer = buffer
             data.status.set(status)
@@ -85,7 +84,7 @@ class Storage internal constructor(val chunkPoolCapacity : Int, val cacheLocatio
             return chunkData
         }
 
-        // Runs the claimed work; if it throws, the chunk is released so waiters don't wait forever
+        // Releases the chunk if the work throws, so waiters don't hang
         fun claimed(work: () -> ByteArray?): ByteArray? {
             try {
                 return work()
@@ -100,9 +99,9 @@ class Storage internal constructor(val chunkPoolCapacity : Int, val cacheLocatio
             when (data.status.get()!!) {
                 ChunkStatus.Readable -> return data.buffer
                 ChunkStatus.Unavailable -> {
-                    // A waiter whose chunk just failed gives up, as before, instead of retrying it in turn
+                    // A waiter gives up on a failed chunk, as before
                     if (waited) return null
-                    // compareAndSet: only one thread downloads a chunk, the rest wait for it
+                    // Only one thread downloads a chunk; the rest wait
                     if (data.status.compareAndSet(ChunkStatus.Unavailable, ChunkStatus.Grabbing)) {
                         return claimed { doDownload() }
                     }
@@ -134,7 +133,7 @@ class Storage internal constructor(val chunkPoolCapacity : Int, val cacheLocatio
                 ChunkStatus.Grabbing, ChunkStatus.Reading -> {
                     waited = true
                     data.mutex.withLock {
-                        // Recheck under the lock: a signal sent before this thread started waiting would otherwise be missed forever
+                        // Recheck under the lock, or a signal sent before the wait is missed
                         while (data.status.get().let { it == ChunkStatus.Grabbing || it == ChunkStatus.Reading }) {
                             data.cv.await(WAIT_RECHECK_SECONDS, TimeUnit.SECONDS)
                         }
@@ -168,17 +167,17 @@ class Storage internal constructor(val chunkPoolCapacity : Int, val cacheLocatio
     fun isChunkDownloaded(chunk: Chunk) =
         File(cacheLocation + chunk.fileName()).exists()
 
-    // Write to a temp file, then rename, so another thread never reads a half-written chunk file
+    // Temp file + rename: readers never see a half-written chunk. A failed write only skips the cache.
     private fun writeChunkFile(chunk: Chunk, data: ByteArray) {
         val target = File(cacheLocation + chunk.fileName()).toPath()
         val temp = target.resolveSibling(target.fileName.toString() + ".part-" + UUID.randomUUID())
-        Files.write(temp, data)
         try {
+            Files.write(temp, data)
             Files.move(temp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
         } catch (e: IOException) {
-            // Windows refuses to replace a file another thread has open; that copy is the same chunk
-            Files.deleteIfExists(temp)
-            if (!Files.exists(target)) throw e
+            runCatching { Files.deleteIfExists(temp) }
+            // Windows can't replace a file another thread has open; that file is the same chunk
+            if (!Files.exists(target)) logger.warn(e) { "Failed to cache chunk ${chunk.fileName()}" }
         }
     }
 
