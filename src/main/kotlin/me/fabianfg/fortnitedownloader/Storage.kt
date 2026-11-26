@@ -97,7 +97,7 @@ class Storage internal constructor(val chunkPoolCapacity : Int, val cacheLocatio
 
         var waited = false
         while (true) {
-            when (data.status.get()) {
+            when (data.status.get()!!) {
                 ChunkStatus.Readable -> return data.buffer
                 ChunkStatus.Unavailable -> {
                     // A waiter whose chunk just failed gives up, as before, instead of retrying it in turn
